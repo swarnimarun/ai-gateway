@@ -1,11 +1,29 @@
+version: "3"
+
 services:
   ai-gateway:
     build: .
     image: ai-gateway
     ports:
-      - "8000:8000"
+      - "8000:6191"
+    networks:
+      vpcbr:
+        ipv4_address: 10.5.0.5
+    depends_on:
+      - dummyai
   dummyai:
     build: crates/dummyai
     image: dummyai
     ports:
       - "8001:8000"
+    networks:
+      vpcbr:
+        ipv4_address: 10.5.0.6
+
+networks:
+  vpcbr:
+    driver: bridge
+    ipam:
+     config:
+       - subnet: 10.5.0.0/16
+         gateway: 10.5.0.1
