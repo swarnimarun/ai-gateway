@@ -1,0 +1,9 @@
+enabled = ["llama7b", "mistral7b", "phi2b"]
+
+[models.llama7b]
+ipaddr = "dummyai"
+port = 8080
+count_tokens = true
+search = "recursive-all" # will search all fields in json body with fieldName "content"
+outheader = "content"
+inheader = "content"

@@ -1,0 +1,11 @@
+services:
+  ai-gateway:
+    build: .
+    image: ai-gateway
+    ports:
+      - "8000:8000"
+  dummyai:
+    build: crates/dummyai
+    image: dummyai
+    ports:
+      - "8001:8000"
