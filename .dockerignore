@@ -1,0 +1,8 @@
+/.git
+**/target
+
+Dockerfile
+docker-compose.yaml
+
+# local aispec
+aispec.toml

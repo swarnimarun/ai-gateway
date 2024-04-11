@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 // use prometheus::register_int_counter;
 use structopt::StructOpt;
+use tokenizers::Tokenizer;
 use tracing::info;
 
 use pingora_core::server::configuration::Opt;
@@ -18,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     ipaddr: String,
     port: u16,
+    host: String,
     count_tokens: bool,
     inheader: String,
     outheader: String,
@@ -49,33 +52,71 @@ impl GatewaySpecification {
 }
 
 pub struct MyGateway {
+    tokenizer: tokenizers::Tokenizer,
     specification: GatewaySpecification,
+}
+
+pub struct Ctx {
+    buffer: Vec<u8>,
+    input_token_count: usize,
+}
+
+impl MyGateway {
+    pub fn get_token_count(&self, s: &str) -> usize {
+        let res = self.tokenizer.encode(s, false).unwrap();
+        res.len()
+    }
 }
 
 #[async_trait]
 impl ProxyHttp for MyGateway {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = Ctx;
+    fn new_ctx(&self) -> Self::CTX {
+        Ctx {
+            buffer: vec![],
+            input_token_count: 0,
+        }
+    }
 
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut pingora_http::RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        // _session.req_header().headers.get("Host")
-        upstream_request
-            .insert_header("Host", "one.one.one.one")
-            .unwrap();
+        if let Some(model) = session.req_header().headers.get("model") {
+            upstream_request
+                .insert_header(
+                    "Host",
+                    self.specification.models[model.to_str().unwrap()]
+                        .host
+                        .as_str(),
+                )
+                .unwrap();
+        }
         Ok(())
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         if self.specification.enabled.len() == 0 {
             session.respond_error(501).await;
             return Ok(true);
         }
-        Ok(false)
+        let mut req_body = vec![];
+        while let Ok(Some(bytes)) = session.read_request_body().await {
+            req_body.extend(bytes);
+        }
+        let req_body: serde_json::error::Result<serde_json::Value> =
+            serde_json::de::from_slice(&req_body);
+        if let Ok(val) = req_body {
+            if let Some(v) = val.as_object() {
+                let src = recursive_search_all(v, "content");
+                ctx.input_token_count = self.get_token_count(&src);
+                return Ok(false);
+            }
+        }
+        session.respond_error(501).await;
+        Ok(true)
     }
 
     async fn upstream_peer(
@@ -83,12 +124,13 @@ impl ProxyHttp for MyGateway {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        if let Some(model) = session.req_header().headers.get("Model") {
+        if let Some(model) = session.req_header().headers.get("model") {
             if let Ok(m) = model.to_str() {
                 if let Some(m) = self.specification.models.get(m) {
                     let addr = (m.ipaddr.as_str(), m.port);
                     info!("connecting to {addr:?}");
 
+                    // TODO: support TLS
                     let peer = Box::new(HttpPeer::new(addr, false, "one.one.one.one".to_string()));
                     return Ok(peer);
                 }
@@ -108,14 +150,54 @@ impl ProxyHttp for MyGateway {
     where
         Self::CTX: Send + Sync,
     {
-        // replace existing header if any
-        // upstream_response
-        //     .insert_header("Server", "MyGateway")
-        //     .unwrap();
         // because we don't support h3
         upstream_response.remove_header("alt-svc");
 
+        upstream_response.remove_header("Content-Length");
+        upstream_response
+            .insert_header("Transfer-Encoding", "Chunked")
+            .unwrap();
+
         Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // buffer the data
+        if let Some(b) = body {
+            ctx.buffer.extend(&b[..]);
+            // drop the body
+            b.clear();
+        }
+        if end_of_stream {
+            info!("end of stream");
+            // This is the last chunk, we can process the data now
+            let mut json_body: serde_json::Value = serde_json::de::from_slice(&ctx.buffer).unwrap();
+            if let Some(value) = session.req_header().headers.get("model") {
+                if let Some(jb) = json_body.as_object_mut() {
+                    let content = recursive_search_all(
+                        jb,
+                        &self.specification.models[value.to_str().unwrap()].outheader,
+                    );
+                    let tok_c = self.get_token_count(&content);
+                    jb.insert("output_token_count".to_string(), tok_c.into());
+                    jb.insert(
+                        "input_token_count".to_string(),
+                        ctx.input_token_count.into(),
+                    );
+                    *body = Some(Bytes::copy_from_slice(json_body.to_string().as_bytes()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn logging(
@@ -131,18 +213,27 @@ impl ProxyHttp for MyGateway {
             "{} response code: {response_code}",
             self.request_summary(session, ctx)
         );
-
-        // self.req_metric.inc();
     }
 }
 
-// RUST_LOG=INFO cargo run --example load_balancer
-// curl 127.0.0.1:6191 -H "Host: one.one.one.one"
-// curl 127.0.0.1:6190/family/ -H "Host: one.one.one.one"
-// curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: password"
-// curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: bad"
-// For metrics
-// curl 127.0.0.1:6192/
+pub fn recursive_search_all(
+    m: &serde_json::Map<String, serde_json::Value>,
+    key: impl AsRef<str>,
+) -> String {
+    let mut ret = String::new();
+    for (k, v) in m {
+        if k == key.as_ref() {
+            v.as_str().map(|s| ret.push_str(s));
+        } else if v.is_object() {
+            if let Some(o) = v.as_object() {
+                let src = recursive_search_all(o, key.as_ref());
+                ret.push_str(&src);
+            }
+        }
+    }
+    ret
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -156,9 +247,10 @@ fn main() {
     let mut my_proxy = pingora_proxy::http_proxy_service(
         &my_server.configuration,
         MyGateway {
+            tokenizer: Tokenizer::from_pretrained("bert-base-cased", None)
+                .expect("failed to get bert base cased tokenizer"),
             specification: GatewaySpecification::load_from_cwd()
                 .expect("failed to get AI Gateway Specification at cwd('.aispec.toml')"),
-            // req_metric: register_int_counter!("reg_counter", "Number of requests").unwrap(),
         },
     );
     my_proxy.add_tcp("0.0.0.0:6191");
